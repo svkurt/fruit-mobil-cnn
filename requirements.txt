@@ -1,0 +1,10 @@
+Flask
+Flask-Cors
+numpy
+opencv-python-headless
+joblib
+tensorflow-cpu
+matplotlib
+seaborn
+scikit-learn
+gunicorn
