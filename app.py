@@ -8,42 +8,9 @@ import joblib
 import threading
 import time
 import gc
+import requests # Model indirmek için gerekli
 from datetime import datetime
-
-# ============================================================
-# 1. SİSTEM VE GPU YAPILANDIRMASI
-# ============================================================
-current_python_dir = os.path.dirname(sys.executable)
-conda_env_path = current_python_dir
-conda_lib_path = os.path.join(conda_env_path, "Library", "bin")
-
-print("\n" + "="*50)
-print(f"🔧 SİSTEM BAŞLATILIYOR...")
-
-os.environ['PATH'] = conda_lib_path + os.pathsep + os.environ['PATH']
-os.environ['PATH'] = os.path.join(conda_env_path, "Library", "bin") + os.pathsep + os.environ['PATH']
-
-if hasattr(os, 'add_dll_directory') and os.path.exists(conda_lib_path):
-    try:
-        os.add_dll_directory(conda_lib_path)
-    except Exception as e:
-        pass
-
 import tensorflow as tf
-
-print("DONANIM KONTROLÜ...")
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"✅ GPU BULUNDU: {len(gpus)} adet aktif.")
-    except RuntimeError as e:
-        print(f"❌ GPU Ayar Hatası: {e}")
-else:
-    print("⚠️ GPU BULUNAMADI! CPU Modu.")
-print("="*50 + "\n")
-
 import matplotlib
 matplotlib.use('Agg') # GUI hatası almamak için
 import matplotlib.pyplot as plt
@@ -56,9 +23,22 @@ from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropou
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau, Callback
 
+# ============================================================
+# 1. BAŞLANGIÇ AYARLARI
+# ============================================================
+print("\n" + "="*50)
+print(f"🔧 SİSTEM BAŞLATILIYOR...")
+
+# GPU Kontrolü (Bilgi amaçlı, zorlama yok)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"✅ GPU BULUNDU: {len(gpus)} adet.")
+else:
+    print("⚠️ GPU BULUNAMADI! CPU Modu kullanılıyor.")
+print("="*50 + "\n")
+
 app = Flask(__name__)
 CORS(app)
-
 plot_lock = threading.Lock()
 
 # ============================================================
@@ -72,6 +52,9 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 MODEL_PATH = os.path.join(MODELS_DIR, "cnn_fruit_best_model.h5")
 CLASSES_PATH = os.path.join(MODELS_DIR, "class_names.pkl")
 
+# LFS için RAW dosya adresi
+MODEL_URL = 'https://github.com/alifuatkurt55/fruit-cnn/raw/main/models/cnn_fruit_best_model.h5'
+
 IMG_SIZE = 100
 BATCH_SIZE = 32
 EPOCHS = 25
@@ -82,7 +65,7 @@ plots_dir = os.path.join(STATIC_DIR, "plots")
 os.makedirs(plots_dir, exist_ok=True)
 
 # ============================================================
-# 3. GLOBAL DEĞİŞKENLER
+# 3. GLOBAL DEĞİŞKENLER VE MODEL YÜKLEME
 # ============================================================
 training_state = {
     "is_training": False,
@@ -103,18 +86,48 @@ cached_results = {
     "class_names": []
 }
 
-def load_global_model():
+def get_model():
+    """
+    Model dosyasını kontrol eder. Eğer dosya yoksa veya
+    LFS pointer (küçük dosya) ise GitHub'dan indirir.
+    """
     global global_model, global_class_names
-    if os.path.exists(MODEL_PATH) and os.path.exists(CLASSES_PATH):
+    
+    # 1. Model dosyasını indir/kontrol et
+    if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1024 * 1024:
+        print("📥 Model dosyası indiriliyor (LFS Fix)...")
         try:
-            print("Model yükleniyor...")
-            global_model = load_model(MODEL_PATH)
-            global_class_names = joblib.load(CLASSES_PATH)
-            print("Model hazır.")
+            response = requests.get(MODEL_URL, stream=True)
+            response.raise_for_status()
+            with open(MODEL_PATH, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print("✅ Model başarıyla indirildi.")
         except Exception as e:
-            print(f"Model yükleme hatası: {e}")
+            print(f"❌ Model indirme hatası: {e}")
+            return None
 
-load_global_model()
+    # 2. Modeli yükle
+    try:
+        print("🧠 Model hafızaya yükleniyor...")
+        global_model = load_model(MODEL_PATH)
+        print("✅ Model hazır.")
+    except Exception as e:
+        print(f"❌ Model yükleme hatası: {e}")
+        global_model = None
+
+    # 3. Sınıf isimlerini yükle
+    if os.path.exists(CLASSES_PATH):
+        try:
+            global_class_names = joblib.load(CLASSES_PATH)
+            print(f"📋 {len(global_class_names)} sınıf yüklendi.")
+        except:
+            print("⚠️ Sınıf dosyası (pkl) okunamadı.")
+    else:
+        print("⚠️ Sınıf dosyası bulunamadı.")
+
+# Uygulama başlarken modeli hazırla
+get_model()
 
 # ============================================================
 # 4. EĞİTİM & CALLBACK
@@ -140,7 +153,6 @@ def plot_training_curves(history):
     save_path = os.path.join(plots_dir, "training_curve.png")
 
     with plot_lock:
-        # OO Style (Daha güvenli)
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
         
         ax1.plot(epochs_range, acc, label='Train Accuracy')
@@ -156,7 +168,7 @@ def plot_training_curves(history):
         ax2.grid(True)
 
         fig.savefig(save_path)
-        plt.close(fig) # Figürü bellekten sil
+        plt.close(fig)
 
 def train_model_background():
     global global_model, global_class_names
@@ -167,7 +179,9 @@ def train_model_background():
         training_state["progress"] = 0
         
         X, y = [], []
-        if not os.path.exists(TRAIN_DIR): raise FileNotFoundError(f"Klasör yok: {TRAIN_DIR}")
+        if not os.path.exists(TRAIN_DIR): 
+            raise FileNotFoundError(f"Eğitim klasörü bulunamadı: {TRAIN_DIR}")
+            
         classes = sorted(os.listdir(TRAIN_DIR))
         
         for cls in classes:
@@ -267,7 +281,12 @@ def get_training_status():
 
 @app.route("/predict", methods=["POST"])
 def predict_single_image():
-    if global_model is None: return jsonify({"error": "Model yüklü değil."}), 500
+    if global_model is None: 
+        # Modeli tekrar yüklemeyi dene
+        get_model()
+        if global_model is None:
+            return jsonify({"error": "Model yüklenemedi. Lütfen bekleyin veya logları kontrol edin."}), 500
+    
     if 'file' not in request.files: return jsonify({"error": "Dosya yok."}), 400
     
     file = request.files['file']
@@ -283,8 +302,10 @@ def predict_single_image():
         pred_idx = np.argmax(probs)
         confidence = float(np.max(probs))
         
-        class_names_list = list(global_class_names)
-        pred_class = class_names_list[pred_idx]
+        if len(global_class_names) > 0:
+            pred_class = global_class_names[pred_idx]
+        else:
+            pred_class = f"Class {pred_idx}"
         
         return jsonify({"class": pred_class, "confidence": f"%{confidence * 100:.2f}"})
     except Exception as e:
@@ -308,7 +329,6 @@ def evaluate():
             if cls not in class_to_idx: continue
             cls_folder = os.path.join(TEST_DIR, cls)
             if not os.path.isdir(cls_folder): continue
-            idx = class_to_idx[cls]
             for img_name in os.listdir(cls_folder):
                 try:
                     img = cv2.imread(os.path.join(cls_folder, img_name))
@@ -322,7 +342,7 @@ def evaluate():
     X_test = np.array(X_test)
     y_indices = np.array(y_indices)
 
-    if len(X_test) == 0: return jsonify({"error": "Test verisi yok."}), 400
+    if len(X_test) == 0: return jsonify({"error": "Test verisi yok veya klasör bulunamadı."}), 400
 
     try:
         print("Evaluate: Tahmin yapılıyor...")
@@ -344,7 +364,7 @@ def evaluate():
 
         return jsonify({
             "accuracy": f"{acc * 100:.2f}%",
-            "model_type": "CNN (GPU)",
+            "model_type": "CNN (CPU)",
             "class_report": report
         })
         
@@ -353,7 +373,7 @@ def evaluate():
         gc.collect()
         return jsonify({"error": f"Değerlendirme hatası: {str(e)}"}), 500
 
-# --- GRAFİK ÇİZİMİ (NESNE TABANLI & GÜVENLİ) ---
+# --- GRAFİK ÇİZİMİ ---
 @app.route("/get-plot/<plot_type>")
 def get_plot(plot_type):
     global cached_results
@@ -375,13 +395,9 @@ def get_plot(plot_type):
     y_probs = cached_results["y_probs"]
     class_names = cached_results["class_names"]
 
-    # Çizim hatası olursa yakala
     try:
         with plot_lock:
-            # Önceki çizimleri temizle
             plt.close('all')
-            
-            # Nesne tabanlı çizim (Figure ve Axis oluştur)
             fig, ax = plt.subplots(figsize=(12, 10))
             
             if plot_type == "confusion_matrix":
@@ -405,19 +421,19 @@ def get_plot(plot_type):
             elif plot_type == "roc_curve":
                 y_test_bin = label_binarize(y_true, classes=range(len(class_names)))
                 n_classes = y_test_bin.shape[1]
-                
                 for i in range(min(n_classes, 20)):
-                    fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_probs[:, i])
-                    roc_auc = auc(fpr, tpr)
-                    ax.plot(fpr, tpr, lw=2, label=f'{class_names[i]} (AUC={roc_auc:.2f})')
+                    if i < y_probs.shape[1]:
+                        fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_probs[:, i])
+                        roc_auc = auc(fpr, tpr)
+                        ax.plot(fpr, tpr, lw=2, label=f'{class_names[i]} (AUC={roc_auc:.2f})')
                 ax.plot([0, 1], [0, 1], 'k--')
                 ax.set_title("ROC Curve")
                 ax.legend(loc="lower right")
 
             plt.tight_layout()
             fig.savefig(save_path)
-            plt.close(fig) # Figürü bellekten sil
-            gc.collect() # Çöp topla
+            plt.close(fig)
+            gc.collect()
         
         return send_from_directory(plots_dir, filename)
 
@@ -430,4 +446,6 @@ def serve_static(filename):
     return send_from_directory(STATIC_DIR, filename)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    # Railway'in atadığı PORT'u al, yoksa 5000 kullan
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
