@@ -233,14 +233,8 @@ def get_plot(plot_type):
             if plot_type == "confusion_matrix":
                 cm = confusion_matrix(y_true, y_pred)
                 unique_indices = sorted(list(set(y_true) | set(y_pred)))
-                # İndekslerin sınıf isimlerine karşılık geldiğinden emin ol
-                labels = []
-                for i in unique_indices:
-                    if i < len(class_names):
-                        labels.append(class_names[i])
-                    else:
-                        labels.append(f"Class {i}")
-                        
+                labels = [class_names[i] if i < len(class_names) else f"Class {i}" for i in unique_indices]
+                
                 sns.heatmap(cm, cmap="Blues", annot=True, fmt="d", xticklabels=labels, yticklabels=labels, ax=ax)
                 ax.set_title("Confusion Matrix")
                 ax.set_xticklabels(labels, rotation=45, ha='right')
@@ -255,10 +249,8 @@ def get_plot(plot_type):
                     top_names = []
                     top_vals = []
                     for i in top_idx:
-                        if i < len(class_names):
-                            top_names.append(class_names[i])
-                        else:
-                            top_names.append(f"Class {i}")
+                        name = class_names[i] if i < len(class_names) else f"Class {i}"
+                        top_names.append(name)
                         top_vals.append(wrong_preds[i])
 
                     ax.bar(top_names, top_vals, color="salmon")
@@ -268,41 +260,43 @@ def get_plot(plot_type):
                     ax.text(0.5, 0.5, "Hata Yok! (Mükemmel Sonuç)", ha='center')
                 
             elif plot_type == "roc_curve":
-                # --- GÜNCELLENMİŞ ROC KODU ---
+                # --- DÜZELTİLEN KISIM BAŞLANGICI ---
                 if y_probs is None:
-                    ax.text(0.5, 0.5, "Olasılık verisi (y_probs) bulunamadı", ha='center')
+                    ax.text(0.5, 0.5, "Olasılık verisi (y_probs) yok", ha='center')
                 else:
-                    # Modelin çıktı boyutunu (sınıf sayısını) al
                     n_classes = y_probs.shape[1]
+                    # Test setindeki mevcut sınıfları bul (Örn: Sadece Elma ve Muz varsa onları al)
+                    present_classes = np.unique(y_true)
                     
-                    # Gerçek değerleri binarize et (One-Hot Encoding)
-                    # classes parametresi 0'dan n_classes'a kadar olmalı
+                    # Binarize işlemini tüm sınıflar için yap
                     y_test_bin = label_binarize(y_true, classes=range(n_classes))
                     
-                    # Eğer test setinde sadece 2 sınıf varsa label_binarize bazen tek sütun döner
+                    # Eğer sadece 2 sınıf varsa (Binary Classification), shape düzeltmesi
                     if n_classes == 2 and y_test_bin.shape[1] == 1:
                         y_test_bin = np.hstack((1 - y_test_bin, y_test_bin))
 
                     lines_drawn = 0
-                    # En çok 20 sınıfı çiz (Grafik okunabilir olsun diye)
-                    for i in range(min(n_classes, 20)):
-                        # Sadece test setinde örneği bulunan sınıflar için çizim yap
-                        # (Hiç örneği olmayan bir sınıfın AUC'si hesaplanamaz)
-                        if np.sum(y_test_bin[:, i]) > 0:
+                    
+                    # Sadece elimizdeki test verisinde bulunan meyveleri çiz (Limiti kaldırdık)
+                    for i in present_classes:
+                        # Eğer bu sınıf modelin bildiği sınıf sınırları içindeyse
+                        if i < n_classes:
+                            # ROC hesapla
                             fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_probs[:, i])
                             roc_auc = auc(fpr, tpr)
                             
-                            # İsimlendirme güvenliği
                             label = class_names[i] if i < len(class_names) else f"Class {i}"
                             ax.plot(fpr, tpr, lw=2, label=f'{label} (AUC={roc_auc:.2f})')
                             lines_drawn += 1
                     
                     if lines_drawn > 0:
                         ax.plot([0, 1], [0, 1], 'k--')
+                        # Legend çok kalabalık olmasın diye fontu küçült
                         ax.legend(loc="lower right", fontsize='small')
-                        ax.set_title("ROC Curve")
+                        ax.set_title(f"ROC Curve ({lines_drawn} Sınıf)")
                     else:
-                        ax.text(0.5, 0.5, "Yeterli veri çeşitliliği yok\n(Tek tip sınıf var)", ha='center')
+                        ax.text(0.5, 0.5, "Çizilecek sınıf bulunamadı", ha='center')
+                # --- DÜZELTİLEN KISIM BİTİŞİ ---
 
             plt.tight_layout()
             fig.savefig(save_path)
@@ -312,7 +306,10 @@ def get_plot(plot_type):
         return send_from_directory(plots_dir, filename)
 
     except Exception as e:
-        print(f"Grafik hatası ({plot_type}): {e}")
+        # Hata detayını terminale yazdır ki Railway loglarında görelim
+        print(f"GRAFİK HATASI ({plot_type}): {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": f"Grafik oluşturulamadı: {e}"}), 500
 
 @app.route('/static/<path:filename>')
