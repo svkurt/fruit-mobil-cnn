@@ -211,6 +211,7 @@ def evaluate():
 
 @app.route("/get-plot/<plot_type>")
 def get_plot(plot_type):
+    # Hazır veriyi kullanarak grafik çiz (Hızlı)
     if cached_results["y_true"] is None:
         load_resources()
         if cached_results["y_true"] is None:
@@ -232,32 +233,76 @@ def get_plot(plot_type):
             if plot_type == "confusion_matrix":
                 cm = confusion_matrix(y_true, y_pred)
                 unique_indices = sorted(list(set(y_true) | set(y_pred)))
-                labels = [class_names[i] for i in unique_indices]
+                # İndekslerin sınıf isimlerine karşılık geldiğinden emin ol
+                labels = []
+                for i in unique_indices:
+                    if i < len(class_names):
+                        labels.append(class_names[i])
+                    else:
+                        labels.append(f"Class {i}")
+                        
                 sns.heatmap(cm, cmap="Blues", annot=True, fmt="d", xticklabels=labels, yticklabels=labels, ax=ax)
                 ax.set_title("Confusion Matrix")
+                ax.set_xticklabels(labels, rotation=45, ha='right')
                 
             elif plot_type == "top10_wrong":
                 cm = confusion_matrix(y_true, y_pred)
                 wrong_preds = cm.sum(axis=1) - np.diag(cm)
                 top_k = min(10, len(wrong_preds))
-                top_idx = np.argsort(wrong_preds)[-top_k:][::-1]
-                top_names = [class_names[i] for i in top_idx if i < len(class_names)]
-                top_vals = [wrong_preds[i] for i in top_idx]
-                ax.bar(top_names, top_vals, color="salmon")
-                ax.set_xticklabels(top_names, rotation=45)
-                ax.set_title("En Çok Hata Yapılanlar")
+                if top_k > 0:
+                    top_idx = np.argsort(wrong_preds)[-top_k:][::-1]
+                    
+                    top_names = []
+                    top_vals = []
+                    for i in top_idx:
+                        if i < len(class_names):
+                            top_names.append(class_names[i])
+                        else:
+                            top_names.append(f"Class {i}")
+                        top_vals.append(wrong_preds[i])
+
+                    ax.bar(top_names, top_vals, color="salmon")
+                    ax.set_xticklabels(top_names, rotation=45, ha='right')
+                    ax.set_title("En Çok Hata Yapılanlar")
+                else:
+                    ax.text(0.5, 0.5, "Hata Yok! (Mükemmel Sonuç)", ha='center')
                 
             elif plot_type == "roc_curve":
-                y_test_bin = label_binarize(y_true, classes=range(len(class_names)))
-                n_classes = y_test_bin.shape[1]
-                for i in range(min(n_classes, 20)):
-                    if i < y_probs.shape[1]:
-                        fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_probs[:, i])
-                        roc_auc = auc(fpr, tpr)
-                        ax.plot(fpr, tpr, lw=2, label=f'{class_names[i]} (AUC={roc_auc:.2f})')
-                ax.plot([0, 1], [0, 1], 'k--')
-                ax.set_title("ROC Curve")
-                ax.legend(loc="lower right")
+                # --- GÜNCELLENMİŞ ROC KODU ---
+                if y_probs is None:
+                    ax.text(0.5, 0.5, "Olasılık verisi (y_probs) bulunamadı", ha='center')
+                else:
+                    # Modelin çıktı boyutunu (sınıf sayısını) al
+                    n_classes = y_probs.shape[1]
+                    
+                    # Gerçek değerleri binarize et (One-Hot Encoding)
+                    # classes parametresi 0'dan n_classes'a kadar olmalı
+                    y_test_bin = label_binarize(y_true, classes=range(n_classes))
+                    
+                    # Eğer test setinde sadece 2 sınıf varsa label_binarize bazen tek sütun döner
+                    if n_classes == 2 and y_test_bin.shape[1] == 1:
+                        y_test_bin = np.hstack((1 - y_test_bin, y_test_bin))
+
+                    lines_drawn = 0
+                    # En çok 20 sınıfı çiz (Grafik okunabilir olsun diye)
+                    for i in range(min(n_classes, 20)):
+                        # Sadece test setinde örneği bulunan sınıflar için çizim yap
+                        # (Hiç örneği olmayan bir sınıfın AUC'si hesaplanamaz)
+                        if np.sum(y_test_bin[:, i]) > 0:
+                            fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_probs[:, i])
+                            roc_auc = auc(fpr, tpr)
+                            
+                            # İsimlendirme güvenliği
+                            label = class_names[i] if i < len(class_names) else f"Class {i}"
+                            ax.plot(fpr, tpr, lw=2, label=f'{label} (AUC={roc_auc:.2f})')
+                            lines_drawn += 1
+                    
+                    if lines_drawn > 0:
+                        ax.plot([0, 1], [0, 1], 'k--')
+                        ax.legend(loc="lower right", fontsize='small')
+                        ax.set_title("ROC Curve")
+                    else:
+                        ax.text(0.5, 0.5, "Yeterli veri çeşitliliği yok\n(Tek tip sınıf var)", ha='center')
 
             plt.tight_layout()
             fig.savefig(save_path)
@@ -267,7 +312,8 @@ def get_plot(plot_type):
         return send_from_directory(plots_dir, filename)
 
     except Exception as e:
-        return jsonify({"error": f"Grafik hatası: {e}"}), 500
+        print(f"Grafik hatası ({plot_type}): {e}")
+        return jsonify({"error": f"Grafik oluşturulamadı: {e}"}), 500
 
 @app.route('/static/<path:filename>')
 def serve_static(filename):
