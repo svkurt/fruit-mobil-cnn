@@ -1,12 +1,10 @@
 from flask import Flask, jsonify, send_from_directory, request, render_template
 from flask_cors import CORS
 import os
-import sys
 import numpy as np
 import cv2
 import joblib
 import threading
-import time
 import gc
 import requests 
 from datetime import datetime
@@ -16,15 +14,14 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, roc_curve, auc
-# label_binarize sildik, manuel yapacağız
+from sklearn.preprocessing import label_binarize
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 # ============================================================
 # 1. BAŞLANGIÇ AYARLARI
 # ============================================================
 print("\n" + "="*50)
-print(f"🔧 SİSTEM BAŞLATILIYOR (Final Hybrid Mode)...")
+print(f"🔧 SİSTEM BAŞLATILIYOR (Final ROC Fix)...")
 
 try:
     tf.config.set_visible_devices([], 'GPU')
@@ -50,7 +47,7 @@ MODEL_PATH = os.path.join(MODELS_DIR, "cnn_fruit_best_model.h5")
 CLASSES_PATH = os.path.join(MODELS_DIR, "class_names.pkl")
 CACHE_PATH = os.path.join(MODELS_DIR, "evaluation_cache.pkl")
 
-# LFS için 'media' subdomain kullanımı (Önemli!)
+# LFS için 'media' subdomain kullanımı
 MODEL_URL = 'https://media.githubusercontent.com/media/alifuatkurt55/fruit-cnn/main/models/cnn_fruit_best_model.h5'
 CACHE_URL = 'https://raw.githubusercontent.com/alifuatkurt55/fruit-cnn/main/models/evaluation_cache.pkl'
 
@@ -80,12 +77,12 @@ training_state = {
 # ============================================================
 def download_file(filepath, url, description):
     if os.path.exists(filepath):
-        # Model dosyası çok küçükse (LFS hatası) sil
+        # Model dosyası çok küçükse sil (LFS hatası önlemi)
         if "model.h5" in filepath and os.path.getsize(filepath) < 5 * 1024 * 1024:
             print(f"⚠️ {description} boyutu hatalı, siliniyor...")
             os.remove(filepath)
         else:
-            return # Dosya sağlam
+            return
 
     print(f"📥 İndiriliyor: {filepath} ...")
     try:
@@ -103,8 +100,10 @@ def download_file(filepath, url, description):
 def load_resources():
     global global_model, global_class_names, cached_results
     
+    # Modeli İndir
     download_file(MODEL_PATH, MODEL_URL, "Model")
     
+    # Modeli Yükle
     if global_model is None and os.path.exists(MODEL_PATH):
         try:
             print("🧠 Model yükleniyor...")
@@ -115,10 +114,12 @@ def load_resources():
             try: os.remove(MODEL_PATH) 
             except: pass
 
+    # Sınıf İsimleri
     if os.path.exists(CLASSES_PATH):
         try: global_class_names = joblib.load(CLASSES_PATH)
         except: pass
 
+    # Analiz Verileri (Cache)
     download_file(CACHE_PATH, CACHE_URL, "Cache")
     
     if cached_results["y_true"] is None and os.path.exists(CACHE_PATH):
@@ -183,7 +184,7 @@ def evaluate():
 
     return jsonify({
         "accuracy": f"{cached_results['accuracy'] * 100:.2f}%",
-        "model_type": "CNN (Offline)",
+        "model_type": "CNN (Cache)",
         "class_report": cached_results['report']
     })
 
@@ -231,45 +232,44 @@ def get_plot(plot_type):
                     ax.text(0.5, 0.5, "Hata Yok", ha='center')
                 
             elif plot_type == "roc_curve":
-                # --- YENİ GARANTİLİ ROC MANTIĞI ---
+                # --- ESKİ KODUN MANTIĞININ DÜZELTİLMİŞ HALİ ---
                 if y_probs is None:
                     ax.text(0.5, 0.5, "Olasılık verisi yok", ha='center')
                 else:
-                    # Modelin çıktı sayısı (sütun sayısı)
+                    # Model kaç sınıf çıktısı veriyor?
                     n_classes = y_probs.shape[1] 
+                    
+                    # Gerçek değerleri (y_true) modelin sınıf sayısına göre binary yap
+                    # Bu sayede y_test_bin ile y_probs aynı boyutta (Sütun sayısı) olur.
+                    y_test_bin = label_binarize(y_true, classes=range(n_classes))
+                    
+                    # Eğer sadece 2 sınıf varsa label_binarize tek sütun döner, onu düzeltelim
+                    if n_classes == 2 and y_test_bin.shape[1] == 1:
+                        y_test_bin = np.hstack((1 - y_test_bin, y_test_bin))
+
                     lines_drawn = 0
-
-                    # Test setinde gerçekten var olan sınıfları bul
-                    unique_true_classes = np.unique(y_true)
-
-                    for i in range(n_classes):
-                        # Sadece test setimizde bu meyveden varsa çizelim
-                        # Yoksa hesaplayacak bir "doğru" değer yoktur.
-                        if i in unique_true_classes:
-                            # Manuel Binary Yapıyoruz:
-                            # Bu meyve ise 1, değilse 0
-                            binary_labels = (y_true == i).astype(int)
-                            
-                            # Bu meyvenin olasılıkları
-                            prob_scores = y_probs[:, i]
-
-                            # Çiz
+                    
+                    # Sadece test verisinde mevcut olan (Unique) sınıfları çiz
+                    present_classes = np.unique(y_true)
+                    
+                    for i in present_classes:
+                        # Eğer indeks geçerliyse
+                        if i < n_classes:
                             try:
-                                fpr, tpr, _ = roc_curve(binary_labels, prob_scores)
+                                fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_probs[:, i])
                                 roc_auc = auc(fpr, tpr)
                                 
                                 label_name = class_names[i] if i < len(class_names) else f"Class {i}"
-                                ax.plot(fpr, tpr, lw=2, label=f'{label_name} ({roc_auc:.2f})')
+                                ax.plot(fpr, tpr, lw=2, label=f'{label_name} (AUC={roc_auc:.2f})')
                                 lines_drawn += 1
-                            except:
-                                pass # Hesaplama hatası olursa geç
+                            except: pass # Hesaplama hatası olursa geç
 
                     if lines_drawn > 0:
                         ax.plot([0, 1], [0, 1], 'k--')
                         ax.legend(loc="lower right", fontsize='small')
-                        ax.set_title(f"ROC Curve ({lines_drawn} Meyve)")
+                        ax.set_title("ROC Curve")
                     else:
-                        ax.text(0.5, 0.5, "Grafik Çizilemedi (Tek Tip Veri)", ha='center')
+                        ax.text(0.5, 0.5, "Grafik Çizilemedi", ha='center')
                 # -----------------------------------
 
             plt.tight_layout()
