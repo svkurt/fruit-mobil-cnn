@@ -21,7 +21,7 @@ from tensorflow.keras.models import Sequential, load_model
 # 1. BAŞLANGIÇ AYARLARI
 # ============================================================
 print("\n" + "="*50)
-print(f"🔧 SİSTEM BAŞLATILIYOR (Final ROC Fix)...")
+print(f"🔧 SİSTEM BAŞLATILIYOR (Final Full Fix)...")
 
 try:
     tf.config.set_visible_devices([], 'GPU')
@@ -37,19 +37,25 @@ plot_lock = threading.Lock()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
-plots_dir = os.path.join(STATIC_DIR, "plots")
+PLOTS_DIR = os.path.join(STATIC_DIR, "plots")
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
-os.makedirs(plots_dir, exist_ok=True)
+os.makedirs(PLOTS_DIR, exist_ok=True)
 
 MODEL_PATH = os.path.join(MODELS_DIR, "cnn_fruit_best_model.h5")
 CLASSES_PATH = os.path.join(MODELS_DIR, "class_names.pkl")
 CACHE_PATH = os.path.join(MODELS_DIR, "evaluation_cache.pkl")
+# Eğitim grafiğinin kaydedileceği yer
+TRAINING_PLOT_PATH = os.path.join(PLOTS_DIR, "training_curve.png")
 
-# LFS için 'media' subdomain kullanımı
+# --- GITHUB LİNKLERİ ---
+# Modeli LFS (media) üzerinden indiriyoruz
 MODEL_URL = 'https://media.githubusercontent.com/media/alifuatkurt55/fruit-cnn/main/models/cnn_fruit_best_model.h5'
+# Cache dosyasını raw üzerinden
 CACHE_URL = 'https://raw.githubusercontent.com/alifuatkurt55/fruit-cnn/main/models/evaluation_cache.pkl'
+# Eğitim grafiğini de raw üzerinden indiriyoruz (GARANTİ ÇÖZÜM)
+TRAINING_PLOT_URL = 'https://raw.githubusercontent.com/alifuatkurt55/fruit-cnn/main/static/plots/training_curve.png'
 
 IMG_SIZE = 100
 global_model = None
@@ -76,13 +82,17 @@ training_state = {
 # 3. YARDIMCI FONKSİYONLAR
 # ============================================================
 def download_file(filepath, url, description):
+    """Dosyayı indirir"""
     if os.path.exists(filepath):
-        # Model dosyası çok küçükse sil (LFS hatası önlemi)
+        # Model dosyası 5MB'dan küçükse sil (LFS hatası)
         if "model.h5" in filepath and os.path.getsize(filepath) < 5 * 1024 * 1024:
-            print(f"⚠️ {description} boyutu hatalı, siliniyor...")
+            print(f"⚠️ {description} hatalı, siliniyor...")
+            os.remove(filepath)
+        # Resim dosyası 0 byte ise sil
+        elif "png" in filepath and os.path.getsize(filepath) == 0:
             os.remove(filepath)
         else:
-            return
+            return # Dosya sağlam
 
     print(f"📥 İndiriliyor: {filepath} ...")
     try:
@@ -91,19 +101,17 @@ def download_file(filepath, url, description):
             with open(filepath, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            print("✅ İndirme tamamlandı.")
+            print(f"✅ İndirme tamamlandı: {description}")
         else:
-            print(f"❌ İndirme başarısız: {response.status_code}")
+            print(f"❌ İndirme başarısız ({description}). Kod: {response.status_code}")
     except Exception as e:
-        print(f"❌ Hata: {e}")
+        print(f"❌ Hata ({description}): {e}")
 
 def load_resources():
     global global_model, global_class_names, cached_results
     
-    # Modeli İndir
+    # 1. Modeli İndir/Yükle
     download_file(MODEL_PATH, MODEL_URL, "Model")
-    
-    # Modeli Yükle
     if global_model is None and os.path.exists(MODEL_PATH):
         try:
             print("🧠 Model yükleniyor...")
@@ -114,14 +122,13 @@ def load_resources():
             try: os.remove(MODEL_PATH) 
             except: pass
 
-    # Sınıf İsimleri
+    # 2. Sınıf İsimleri
     if os.path.exists(CLASSES_PATH):
         try: global_class_names = joblib.load(CLASSES_PATH)
         except: pass
 
-    # Analiz Verileri (Cache)
+    # 3. Analiz Verileri (Cache)
     download_file(CACHE_PATH, CACHE_URL, "Cache")
-    
     if cached_results["y_true"] is None and os.path.exists(CACHE_PATH):
         try:
             data = joblib.load(CACHE_PATH)
@@ -132,6 +139,9 @@ def load_resources():
         except Exception as e:
             print(f"⚠️ Cache hatası: {e}")
 
+    # 4. Eğitim Grafiğini İndir (EKLENDİ)
+    download_file(TRAINING_PLOT_PATH, TRAINING_PLOT_URL, "Eğitim Grafiği")
+
 load_resources()
 
 # ============================================================
@@ -139,7 +149,7 @@ load_resources()
 # ============================================================
 @app.route('/')
 def index():
-    return "Meyve AI Backend"
+    return "Meyve AI Backend Aktif"
 
 @app.route("/predict", methods=["POST"])
 def predict_single_image():
@@ -184,20 +194,32 @@ def evaluate():
 
     return jsonify({
         "accuracy": f"{cached_results['accuracy'] * 100:.2f}%",
-        "model_type": "CNN (Cache)",
+        "model_type": "CNN (Offline)",
         "class_report": cached_results['report']
     })
 
 @app.route("/get-plot/<plot_type>")
 def get_plot(plot_type):
-    # Veri kontrolü
+    filename = f"{plot_type}.png"
+    save_path = os.path.join(PLOTS_DIR, filename)
+
+    # --- EĞİTİM GRAFİĞİ İÇİN ÖZEL KONTROL ---
+    if plot_type == "training_curve":
+        # Dosya yoksa indirmeyi dene
+        if not os.path.exists(save_path):
+            download_file(save_path, TRAINING_PLOT_URL, "Eğitim Grafiği")
+        
+        if os.path.exists(save_path):
+            return send_from_directory(PLOTS_DIR, filename)
+        else:
+            return jsonify({"error": "Grafik GitHub'da bulunamadı."}), 404
+    # ------------------------------------------
+
+    # Diğer grafikler (Confusion, ROC vb.) için veri kontrolü
     if cached_results["y_true"] is None:
         load_resources()
         if cached_results["y_true"] is None:
             return jsonify({"error": "Veri yok."}), 400
-
-    filename = f"{plot_type}.png"
-    save_path = os.path.join(plots_dir, filename)
     
     y_true = np.array(cached_results["y_true"])
     y_pred = np.array(cached_results["y_pred"])
@@ -232,37 +254,26 @@ def get_plot(plot_type):
                     ax.text(0.5, 0.5, "Hata Yok", ha='center')
                 
             elif plot_type == "roc_curve":
-                # --- ESKİ KODUN MANTIĞININ DÜZELTİLMİŞ HALİ ---
                 if y_probs is None:
                     ax.text(0.5, 0.5, "Olasılık verisi yok", ha='center')
                 else:
-                    # Model kaç sınıf çıktısı veriyor?
                     n_classes = y_probs.shape[1] 
-                    
-                    # Gerçek değerleri (y_true) modelin sınıf sayısına göre binary yap
-                    # Bu sayede y_test_bin ile y_probs aynı boyutta (Sütun sayısı) olur.
                     y_test_bin = label_binarize(y_true, classes=range(n_classes))
-                    
-                    # Eğer sadece 2 sınıf varsa label_binarize tek sütun döner, onu düzeltelim
                     if n_classes == 2 and y_test_bin.shape[1] == 1:
                         y_test_bin = np.hstack((1 - y_test_bin, y_test_bin))
 
                     lines_drawn = 0
-                    
-                    # Sadece test verisinde mevcut olan (Unique) sınıfları çiz
                     present_classes = np.unique(y_true)
                     
                     for i in present_classes:
-                        # Eğer indeks geçerliyse
                         if i < n_classes:
                             try:
                                 fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_probs[:, i])
                                 roc_auc = auc(fpr, tpr)
-                                
                                 label_name = class_names[i] if i < len(class_names) else f"Class {i}"
-                                ax.plot(fpr, tpr, lw=2, label=f'{label_name} (AUC={roc_auc:.2f})')
+                                ax.plot(fpr, tpr, lw=2, label=f'{label_name} ({roc_auc:.2f})')
                                 lines_drawn += 1
-                            except: pass # Hesaplama hatası olursa geç
+                            except: pass
 
                     if lines_drawn > 0:
                         ax.plot([0, 1], [0, 1], 'k--')
@@ -270,14 +281,13 @@ def get_plot(plot_type):
                         ax.set_title("ROC Curve")
                     else:
                         ax.text(0.5, 0.5, "Grafik Çizilemedi", ha='center')
-                # -----------------------------------
 
             plt.tight_layout()
             fig.savefig(save_path)
             plt.close(fig)
             gc.collect()
         
-        return send_from_directory(plots_dir, filename)
+        return send_from_directory(PLOTS_DIR, filename)
 
     except Exception as e:
         print(f"Grafik Hatası: {e}")
