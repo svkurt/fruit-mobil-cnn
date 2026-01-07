@@ -12,7 +12,7 @@ import requests
 from datetime import datetime
 import tensorflow as tf
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg') # GUI hatası almamak için
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, roc_curve, auc
@@ -67,6 +67,14 @@ cached_results = {
     "class_names": [],
     "accuracy": 0,
     "report": {}
+}
+
+training_state = {
+    "is_training": False,
+    "status": "Idle",
+    "progress": 0,
+    "message": "Model eğitimi bekleniyor.",
+    "last_updated": None
 }
 
 # ============================================================
