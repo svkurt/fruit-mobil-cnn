@@ -1,41 +1,27 @@
 from flask import Flask, jsonify, send_from_directory, request, render_template
 from flask_cors import CORS
 import os
-import sys
 import numpy as np
 import cv2
 import joblib
 import threading
-import time
 import gc
-import requests # Model indirmek için gerekli
+import requests
 from datetime import datetime
 import tensorflow as tf
 import matplotlib
-matplotlib.use('Agg') # GUI hatası almamak için
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, roc_curve, auc
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelBinarizer, label_binarize
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization, Activation
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau, Callback
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+from sklearn.preprocessing import label_binarize
+from tensorflow.keras.models import load_model
 
 # ============================================================
 # 1. BAŞLANGIÇ AYARLARI
 # ============================================================
 print("\n" + "="*50)
-print(f"🔧 SİSTEM BAŞLATILIYOR...")
-
-# GPU Kontrolü (Bilgi amaçlı, zorlama yok)
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    print(f"✅ GPU BULUNDU: {len(gpus)} adet.")
-else:
-    print("⚠️ GPU BULUNAMADI! CPU Modu kullanılıyor.")
-print("="*50 + "\n")
+print(f"🔧 SİSTEM BAŞLATILIYOR (Offline Mode)...")
 
 app = Flask(__name__)
 CORS(app)
@@ -45,248 +31,115 @@ plot_lock = threading.Lock()
 # 2. DOSYA YOLLARI
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TRAIN_DIR = os.path.join(BASE_DIR, "fruits-360_100x100_mini/train")
-TEST_DIR = os.path.join(BASE_DIR, "fruits-360_100x100_mini/test")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
-MODEL_PATH = os.path.join(MODELS_DIR, "cnn_fruit_best_model.h5")
-CLASSES_PATH = os.path.join(MODELS_DIR, "class_names.pkl")
-
-# LFS için RAW dosya adresi
-MODEL_URL = 'https://github.com/alifuatkurt55/fruit-cnn/raw/main/models/cnn_fruit_best_model.h5'
-
-IMG_SIZE = 100
-BATCH_SIZE = 32
-EPOCHS = 25
+plots_dir = os.path.join(STATIC_DIR, "plots")
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
-plots_dir = os.path.join(STATIC_DIR, "plots")
 os.makedirs(plots_dir, exist_ok=True)
 
-# ============================================================
-# 3. GLOBAL DEĞİŞKENLER VE MODEL YÜKLEME
-# ============================================================
-training_state = {
-    "is_training": False,
-    "status": "Idle",
-    "progress": 0,
-    "message": "Model eğitimi bekleniyor.",
-    "last_updated": None
-}
+MODEL_PATH = os.path.join(MODELS_DIR, "cnn_fruit_best_model.h5")
+CLASSES_PATH = os.path.join(MODELS_DIR, "class_names.pkl")
+# Hazır sonuç dosyasının yolu
+CACHE_PATH = os.path.join(MODELS_DIR, "evaluation_cache.pkl")
 
+# GitHub URL'leri
+MODEL_URL = 'https://raw.githubusercontent.com/alifuatkurt55/fruit-cnn/main/models/cnn_fruit_best_model.h5'
+CACHE_URL = 'https://raw.githubusercontent.com/alifuatkurt55/fruit-cnn/main/models/evaluation_cache.pkl'
+
+IMG_SIZE = 100
 global_model = None
 global_class_names = []
 
 # --- CACHE (ÖNBELLEK) ---
+# Başlangıçta boş, dosya yüklenince dolacak
 cached_results = {
     "y_true": None,
     "y_pred": None,
     "y_probs": None,
-    "class_names": []
+    "class_names": [],
+    "accuracy": 0,
+    "report": {}
 }
 
-def get_model():
-    """
-    Model dosyasını kontrol eder. Eğer dosya yoksa veya
-    LFS pointer (küçük dosya) ise GitHub'dan indirir.
-    """
-    global global_model, global_class_names
-    
-    # 1. Model dosyasını indir/kontrol et
-    if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1024 * 1024:
-        print("📥 Model dosyası indiriliyor (LFS Fix)...")
+# ============================================================
+# 3. YARDIMCI FONKSİYONLAR
+# ============================================================
+def download_if_not_exists(filepath, url, description):
+    """Dosya yoksa GitHub'dan indirir"""
+    if not os.path.exists(filepath) or os.path.getsize(filepath) < 1024:
+        print(f"📥 {description} indiriliyor...")
         try:
-            response = requests.get(MODEL_URL, stream=True)
-            response.raise_for_status()
-            with open(MODEL_PATH, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print("✅ Model başarıyla indirildi.")
+            response = requests.get(url, stream=True)
+            if response.status_code == 200:
+                with open(filepath, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print(f"✅ {description} indirildi.")
+                return True
+            else:
+                print(f"❌ {description} indirilemedi. Kod: {response.status_code}")
+                return False
         except Exception as e:
-            print(f"❌ Model indirme hatası: {e}")
-            return None
+            print(f"❌ İndirme hatası: {e}")
+            return False
+    return True
 
-    # 2. Modeli yükle
-    try:
-        print("🧠 Model hafızaya yükleniyor...")
-        global_model = load_model(MODEL_PATH)
-        print("✅ Model hazır.")
-    except Exception as e:
-        print(f"❌ Model yükleme hatası: {e}")
-        global_model = None
+def load_system():
+    global global_model, global_class_names, cached_results
+    
+    # 1. Modeli İndir ve Yükle
+    if download_if_not_exists(MODEL_PATH, MODEL_URL, "Model Dosyası"):
+        try:
+            global_model = load_model(MODEL_PATH)
+            print("🧠 Model hafızaya yüklendi.")
+        except Exception as e:
+            print(f"⚠️ Model yüklenirken hata: {e}")
 
-    # 3. Sınıf isimlerini yükle
+    # 2. Sınıf İsimlerini Yükle
     if os.path.exists(CLASSES_PATH):
         try:
             global_class_names = joblib.load(CLASSES_PATH)
-            print(f"📋 {len(global_class_names)} sınıf yüklendi.")
-        except:
-            print("⚠️ Sınıf dosyası (pkl) okunamadı.")
-    else:
-        print("⚠️ Sınıf dosyası bulunamadı.")
+        except: pass
 
-# Uygulama başlarken modeli hazırla
-get_model()
-
-# ============================================================
-# 4. EĞİTİM & CALLBACK
-# ============================================================
-class FlaskStatusCallback(Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        logs = logs or {}
-        acc = logs.get('accuracy', 0)
-        val_acc = logs.get('val_accuracy', 0)
-        training_state["status"] = "Training"
-        training_state["progress"] = epoch + 1
-        training_state["message"] = f"Epoch {epoch + 1}/{EPOCHS} Bitti. Başarı: %{acc*100:.1f} (Val: %{val_acc*100:.1f})"
-        training_state["last_updated"] = datetime.now().strftime("%H:%M:%S")
-        print(f"Training: {training_state['message']}")
-
-def plot_training_curves(history):
-    acc = history.history['accuracy']
-    val_acc = history.history['val_accuracy']
-    loss = history.history['loss']
-    val_loss = history.history['val_loss']
-    epochs_range = range(len(acc))
-
-    save_path = os.path.join(plots_dir, "training_curve.png")
-
-    with plot_lock:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-        
-        ax1.plot(epochs_range, acc, label='Train Accuracy')
-        ax1.plot(epochs_range, val_acc, label='Val Accuracy')
-        ax1.legend(loc='lower right')
-        ax1.set_title('Accuracy')
-        ax1.grid(True)
-
-        ax2.plot(epochs_range, loss, label='Train Loss')
-        ax2.plot(epochs_range, val_loss, label='Val Loss')
-        ax2.legend(loc='upper right')
-        ax2.set_title('Loss')
-        ax2.grid(True)
-
-        fig.savefig(save_path)
-        plt.close(fig)
-
-def train_model_background():
-    global global_model, global_class_names
-    try:
-        training_state["is_training"] = True
-        training_state["status"] = "Loading Data"
-        training_state["message"] = "Veriler hazırlanıyor..."
-        training_state["progress"] = 0
-        
-        X, y = [], []
-        if not os.path.exists(TRAIN_DIR): 
-            raise FileNotFoundError(f"Eğitim klasörü bulunamadı: {TRAIN_DIR}")
+    # 3. HAZIR TEST SONUÇLARINI İNDİR VE YÜKLE
+    # Bu kısım resim taramak yerine hazır dosyayı okur
+    if download_if_not_exists(CACHE_PATH, CACHE_URL, "Test Sonuç Dosyası"):
+        try:
+            data = joblib.load(CACHE_PATH)
+            cached_results["y_true"] = data["y_true"]
+            cached_results["y_pred"] = data["y_pred"]
+            cached_results["y_probs"] = data["y_probs"]
+            cached_results["class_names"] = data["class_names"]
+            cached_results["accuracy"] = data["accuracy"]
+            cached_results["report"] = data["report"]
+            print("📊 Hazır test sonuçları başarıyla yüklendi.")
             
-        classes = sorted(os.listdir(TRAIN_DIR))
-        
-        for cls in classes:
-            path = os.path.join(TRAIN_DIR, cls)
-            if not os.path.isdir(path): continue
-            for img_name in os.listdir(path):
-                try:
-                    img = cv2.imread(os.path.join(path, img_name))
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-                    X.append(img)
-                    y.append(cls)
-                except: pass
-        
-        if len(X) == 0:
-            raise ValueError("Eğitim verisi bulunamadı!")
+            # Sınıf isimlerini buradan da güncelleyebiliriz
+            if not global_class_names:
+                global_class_names = data["class_names"]
+                
+        except Exception as e:
+            print(f"⚠️ Test sonuçları okunamadı: {e}")
 
-        X = np.array(X, dtype="float32") / 255.0
-        y = np.array(y)
-        
-        lb = LabelBinarizer()
-        y_encoded = lb.fit_transform(y)
-        classes_detected = lb.classes_
-        joblib.dump(classes_detected, CLASSES_PATH)
-        
-        X_train, X_val, y_train, y_val = train_test_split(X, y_encoded, test_size=0.2, random_state=42)
-        
-        training_state["status"] = "Model Building"
-        training_state["message"] = f"Model derleniyor... ({len(X_train)} veri)"
-        
-        model = Sequential([
-            Conv2D(32, (3, 3), padding="same", input_shape=(IMG_SIZE, IMG_SIZE, 3)),
-            BatchNormalization(), Activation("relu"), MaxPooling2D((2, 2)), Dropout(0.25),
-            Conv2D(64, (3, 3), padding="same"),
-            BatchNormalization(), Activation("relu"), MaxPooling2D((2, 2)), Dropout(0.25),
-            Conv2D(128, (3, 3), padding="same"),
-            BatchNormalization(), Activation("relu"), MaxPooling2D((2, 2)), Dropout(0.25),
-            Flatten(),
-            Dense(512), BatchNormalization(), Activation("relu"), Dropout(0.5),
-            Dense(len(classes_detected), activation="softmax")
-        ])
-        
-        model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
-        
-        checkpoint = ModelCheckpoint(MODEL_PATH, monitor="val_accuracy", mode="max", save_best_only=True, verbose=0)
-        early_stop = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
-        lr_scheduler = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6)
-        
-        aug = ImageDataGenerator(rotation_range=20, width_shift_range=0.1, height_shift_range=0.1, horizontal_flip=True)
-        
-        training_state["status"] = "Training Started"
-        
-        history = model.fit(
-            aug.flow(X_train, y_train, batch_size=BATCH_SIZE),
-            validation_data=(X_val, y_val),
-            steps_per_epoch=len(X_train) // BATCH_SIZE,
-            epochs=EPOCHS,
-            callbacks=[checkpoint, early_stop, lr_scheduler, FlaskStatusCallback()]
-        )
-        
-        plot_training_curves(history)
-        
-        del X_train, X_val, y_train, y_val, X, y
-        gc.collect()
-        tf.keras.backend.clear_session()
-        
-        global_model = load_model(MODEL_PATH)
-        global_class_names = classes_detected
-        
-        training_state["status"] = "Completed"
-        training_state["message"] = "Eğitim Tamamlandı."
-
-    except Exception as e:
-        print(f"Eğitim Hatası: {str(e)}")
-        training_state["status"] = "Error"
-        training_state["message"] = f"Hata: {str(e)}"
-    finally:
-        training_state["is_training"] = False
+# Sistemi başlat
+load_system()
 
 # ============================================================
-# 5. ROUTES
+# 4. ROUTES
 # ============================================================
 @app.route('/')
 def index():
-    return render_template('index.html')
-
-@app.route("/train", methods=["GET", "POST"])
-def trigger_training():
-    if training_state["is_training"]:
-        return jsonify({"status": "error", "message": "Eğitim zaten devam ediyor."})
-    threading.Thread(target=train_model_background, daemon=True).start()
-    return jsonify({"status": "success", "message": "Eğitim başlatıldı."})
-
-@app.route("/train-status")
-def get_training_status():
-    return jsonify(training_state)
+    return "Meyve AI Backend Çalışıyor"
 
 @app.route("/predict", methods=["POST"])
 def predict_single_image():
     if global_model is None: 
-        # Modeli tekrar yüklemeyi dene
-        get_model()
+        load_system()
         if global_model is None:
-            return jsonify({"error": "Model yüklenemedi. Lütfen bekleyin veya logları kontrol edin."}), 500
-    
+            return jsonify({"error": "Model yüklenemedi."}), 500
+            
     if 'file' not in request.files: return jsonify({"error": "Dosya yok."}), 400
     
     file = request.files['file']
@@ -302,10 +155,7 @@ def predict_single_image():
         pred_idx = np.argmax(probs)
         confidence = float(np.max(probs))
         
-        if len(global_class_names) > 0:
-            pred_class = global_class_names[pred_idx]
-        else:
-            pred_class = f"Class {pred_idx}"
+        pred_class = global_class_names[pred_idx] if len(global_class_names) > 0 else str(pred_idx)
         
         return jsonify({"class": pred_class, "confidence": f"%{confidence * 100:.2f}"})
     except Exception as e:
@@ -313,83 +163,30 @@ def predict_single_image():
 
 @app.route("/evaluate")
 def evaluate():
-    global cached_results
-    if global_model is None: return jsonify({"error": "Model bulunamadı."}), 500
-    gc.collect()
+    # Artık hesaplama yapmıyoruz, hazır veriyi döndürüyoruz
+    if cached_results["y_true"] is None:
+        # Eğer dosya inmemişse tekrar dene
+        load_system()
+        if cached_results["y_true"] is None:
+             return jsonify({"error": "Hazır test verisi bulunamadı."}), 500
 
-    X_test, y_indices = [], []
-    if len(global_class_names) == 0: return jsonify({"error": "Sınıf listesi boş."}), 500
-    
-    class_names_list = list(global_class_names)
-    class_to_idx = {cls: i for i, cls in enumerate(class_names_list)}
-
-    print("Evaluate: Veri okunuyor...")
-    if os.path.exists(TEST_DIR):
-        for cls in sorted(os.listdir(TEST_DIR)):
-            if cls not in class_to_idx: continue
-            cls_folder = os.path.join(TEST_DIR, cls)
-            if not os.path.isdir(cls_folder): continue
-            for img_name in os.listdir(cls_folder):
-                try:
-                    img = cv2.imread(os.path.join(cls_folder, img_name))
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-                    img = img.astype("float32") / 255.0
-                    X_test.append(img)
-                    y_indices.append(idx)
-                except: pass
-
-    X_test = np.array(X_test)
-    y_indices = np.array(y_indices)
-
-    if len(X_test) == 0: return jsonify({"error": "Test verisi yok veya klasör bulunamadı."}), 400
-
-    try:
-        print("Evaluate: Tahmin yapılıyor...")
-        y_pred_probs = global_model.predict(X_test, batch_size=16, verbose=1)
-        y_pred = np.argmax(y_pred_probs, axis=1)
-
-        acc = accuracy_score(y_indices, y_pred)
-        report = classification_report(y_indices, y_pred, target_names=class_names_list, output_dict=True)
-        
-        # --- CACHE'E AT ---
-        cached_results["y_true"] = y_indices
-        cached_results["y_pred"] = y_pred
-        cached_results["y_probs"] = y_pred_probs
-        cached_results["class_names"] = class_names_list
-        print("Evaluate: Sonuçlar önbelleklendi.")
-
-        del X_test
-        gc.collect()
-
-        return jsonify({
-            "accuracy": f"{acc * 100:.2f}%",
-            "model_type": "CNN (CPU)",
-            "class_report": report
-        })
-        
-    except Exception as e:
-        print(f"Evaluate Kritik Hata: {e}")
-        gc.collect()
-        return jsonify({"error": f"Değerlendirme hatası: {str(e)}"}), 500
+    return jsonify({
+        "accuracy": f"{cached_results['accuracy'] * 100:.2f}%",
+        "model_type": "CNN (Pre-calculated)",
+        "class_report": cached_results['report']
+    })
 
 # --- GRAFİK ÇİZİMİ ---
+# Burası değişmedi, çünkü veriler cached_results içinde zaten var
 @app.route("/get-plot/<plot_type>")
 def get_plot(plot_type):
-    global cached_results
-    
     if cached_results["y_true"] is None:
-        return jsonify({"error": "Lütfen önce 'Test Et' butonuna basın."}), 400
+        return jsonify({"error": "Veri yok."}), 400
 
     filename = f"{plot_type}.png"
     save_path = os.path.join(plots_dir, filename)
     
-    if plot_type == "training_curve":
-        if os.path.exists(save_path):
-            return send_from_directory(plots_dir, filename)
-        else:
-            return jsonify({"error": "Eğitim grafiği bulunamadı"}), 404
-
+    # Grafikleri her seferinde çizmek yerine var olan datayı kullanıyoruz
     y_true = cached_results["y_true"]
     y_pred = cached_results["y_pred"]
     y_probs = cached_results["y_probs"]
@@ -438,14 +235,12 @@ def get_plot(plot_type):
         return send_from_directory(plots_dir, filename)
 
     except Exception as e:
-        print(f"Grafik hatası ({plot_type}): {e}")
-        return jsonify({"error": f"Grafik oluşturulamadı: {e}"}), 500
+        return jsonify({"error": f"Grafik hatası: {e}"}), 500
 
 @app.route('/static/<path:filename>')
 def serve_static(filename):
     return send_from_directory(STATIC_DIR, filename)
 
 if __name__ == "__main__":
-    # Railway'in atadığı PORT'u al, yoksa 5000 kullan
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
