@@ -1,2 +1,2 @@
-# fruit-cnn
-fruit cnn
+# fruit-mobil-cnn
+fruit mobil cnn
