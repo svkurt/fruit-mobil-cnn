@@ -17,3 +17,4 @@ with open("models/model.tflite", "wb") as f:
     f.write(tflite_model)
 
 print("✅ Başarılı! 'models/model.tflite' dosyası oluşturuldu.")
+
